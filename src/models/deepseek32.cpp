@@ -3,6 +3,124 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-dsa.h"
 
+static size_t deepseek32_hc_elem_offset(const ggml_tensor * t, int64_t i) {
+    return ggml_row_size(t->type, i);
+}
+
+static ggml_tensor * deepseek32_hc_view_1d(ggml_context * ctx, ggml_tensor * t, int64_t ne0, int64_t i0) {
+    return ggml_view_1d(ctx, t, ne0, deepseek32_hc_elem_offset(t, i0));
+}
+
+static ggml_tensor * deepseek32_hc_view_2d(
+        ggml_context * ctx, ggml_tensor * t, int64_t ne0, int64_t ne1, int64_t i0) {
+    return ggml_view_2d(ctx, t, ne0, ne1, t->nb[1], deepseek32_hc_elem_offset(t, i0));
+}
+
+static ggml_tensor * deepseek32_hc_mean(ggml_context * ctx, ggml_tensor * x) {
+    const int64_t hc = x->ne[1];
+    ggml_tensor * acc = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], 0);
+    for (int64_t stream = 1; stream < hc; ++stream) {
+        acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], stream*x->nb[1]));
+    }
+    return ggml_scale(ctx, acc, 1.0f / hc);
+}
+
+static ggml_tensor * deepseek32_hc_pre(
+        ggml_context * ctx,
+        ggml_tensor * x,
+        ggml_tensor * hc_fn,
+        ggml_tensor * hc_scale,
+        ggml_tensor * hc_base,
+        float norm_rms_eps,
+        float hc_eps,
+        uint32_t sinkhorn_iters,
+        int64_t n_embd,
+        ggml_tensor ** post,
+        ggml_tensor ** comb) {
+    const int64_t hc = x->ne[1];
+    const int64_t nt = x->ne[2];
+    const int64_t hc_dim = hc * n_embd;
+    const int64_t hc_mix_dim = (2 + hc) * hc;
+
+    GGML_ASSERT(hc == 4 && hc_fn && hc_scale && hc_base);
+    GGML_ASSERT(hc_fn->ne[1] == hc_mix_dim && hc_base->ne[0] == hc_mix_dim && hc_scale->ne[0] == 3);
+
+    ggml_tensor * flat = ggml_reshape_2d(ctx, x, hc_dim, nt);
+    ggml_tensor * flat_norm = ggml_rms_norm(ctx, flat, norm_rms_eps);
+    ggml_tensor * mixes = ggml_mul_mat(ctx, hc_fn, flat_norm);
+
+    ggml_tensor * scale_pre = deepseek32_hc_view_1d(ctx, hc_scale, 1, 0);
+    ggml_tensor * scale_post = deepseek32_hc_view_1d(ctx, hc_scale, 1, 1);
+    ggml_tensor * scale_comb = deepseek32_hc_view_1d(ctx, hc_scale, 1, 2);
+    ggml_tensor * base_pre = deepseek32_hc_view_2d(ctx, hc_base, hc, 1, 0);
+    ggml_tensor * base_post = deepseek32_hc_view_2d(ctx, hc_base, hc, 1, hc);
+    ggml_tensor * base_comb = deepseek32_hc_view_2d(ctx, hc_base, hc * hc, 1, 2 * hc);
+
+    ggml_tensor * pre = deepseek32_hc_view_2d(ctx, mixes, hc, nt, 0);
+    pre = ggml_add(ctx, ggml_mul(ctx, pre, scale_pre), base_pre);
+    pre = ggml_sigmoid(ctx, pre);
+
+    *post = deepseek32_hc_view_2d(ctx, mixes, hc, nt, hc);
+    *post = ggml_add(ctx, ggml_mul(ctx, *post, scale_post), base_post);
+    *post = ggml_scale(ctx, ggml_sigmoid(ctx, *post), 2.0f);
+
+    *comb = deepseek32_hc_view_2d(ctx, mixes, hc * hc, nt, 2 * hc);
+    *comb = ggml_add(ctx, ggml_mul(ctx, *comb, scale_comb), base_comb);
+    *comb = ggml_clamp(ctx, *comb, -30.0f, 30.0f);
+    *comb = ggml_reshape_3d(ctx, *comb, hc, hc, nt);
+    *comb = ggml_soft_max(ctx, *comb);
+
+    ggml_tensor * eps = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    eps = ggml_fill(ctx, eps, hc_eps);
+    auto norm_dst = [&]() {
+        ggml_tensor * sum = ggml_cont(ctx, ggml_permute(ctx, *comb, 1, 0, 2, 3));
+        sum = ggml_add(ctx, ggml_sum_rows(ctx, sum), eps);
+        *comb = ggml_div(ctx, *comb, ggml_permute(ctx, sum, 1, 0, 2, 3));
+    };
+    auto norm_src = [&]() {
+        ggml_tensor * sum = ggml_add(ctx, ggml_sum_rows(ctx, *comb), eps);
+        *comb = ggml_div(ctx, *comb, sum);
+    };
+    norm_dst();
+    for (uint32_t iter = 1; iter < sinkhorn_iters; ++iter) {
+        norm_src();
+        norm_dst();
+    }
+
+    ggml_tensor * result = nullptr;
+    for (int64_t stream = 0; stream < hc; ++stream) {
+        ggml_tensor * x_stream = ggml_view_2d(ctx, x, n_embd, nt, x->nb[2], stream*x->nb[1]);
+        ggml_tensor * gate = ggml_view_2d(ctx, pre, 1, nt, pre->nb[1], stream*pre->nb[0]);
+        ggml_tensor * term = ggml_mul(ctx, x_stream, gate);
+        result = result ? ggml_add(ctx, result, term) : term;
+    }
+    return result;
+}
+
+static ggml_tensor * deepseek32_hc_post(
+        ggml_context * ctx,
+        ggml_tensor * x,
+        ggml_tensor * residual,
+        ggml_tensor * post,
+        ggml_tensor * comb,
+        int64_t n_embd) {
+    const int64_t hc = residual->ne[1];
+    const int64_t nt = x->ne[1];
+    ggml_tensor * out = nullptr;
+    for (int64_t dst = 0; dst < hc; ++dst) {
+        ggml_tensor * post_dst = ggml_view_2d(ctx, post, 1, nt, post->nb[1], dst*post->nb[0]);
+        ggml_tensor * cur = ggml_mul(ctx, x, post_dst);
+        for (int64_t src = 0; src < hc; ++src) {
+            ggml_tensor * res_src = ggml_view_2d(ctx, residual, n_embd, nt, residual->nb[2], src*residual->nb[1]);
+            ggml_tensor * comb_src_dst = ggml_view_2d(ctx, comb, 1, nt, comb->nb[2], src*comb->nb[0] + dst*comb->nb[1]);
+            cur = ggml_add(ctx, cur, ggml_mul(ctx, res_src, comb_src_dst));
+        }
+        cur = ggml_reshape_3d(ctx, cur, n_embd, 1, nt);
+        out = out ? ggml_concat(ctx, out, cur, 1) : cur;
+    }
+    return out;
+}
+
 void llama_model_deepseek32::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
@@ -27,6 +145,18 @@ void llama_model_deepseek32::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+
+    // Optional mHC metadata keeps existing DeepSeek32 GGUFs on the single-stream path.
+    ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
+    if (hparams.dsv4_hc_mult > 0) {
+        ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+        if (!ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON, hparams.dsv4_hc_eps, false)) {
+            hparams.dsv4_hc_eps = 1e-6f;
+        }
+        if (hparams.dsv4_hc_mult != 4 || hparams.dsv4_hc_sinkhorn_iters == 0) {
+            throw std::runtime_error("DEEPSEEK32 mHC requires 4 residual streams and non-zero Sinkhorn iterations");
+        }
+    }
 
     // Expert gating function
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
@@ -106,6 +236,17 @@ void llama_model_deepseek32::load_arch_tensors(llama_model_loader & ml) {
         layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, flags);
         layer.indexer_attn_k   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,   "weight", i), {n_embd, hparams.indexer_head_size}, flags);
         layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * hparams.indexer_head_size}, flags);
+
+        if (hparams.dsv4_hc_mult > 0) {
+            const int64_t hc_dim = hparams.dsv4_hc_mult * n_embd;
+            const int64_t hc_mix_dim = (2 + hparams.dsv4_hc_mult) * hparams.dsv4_hc_mult;
+            layer.hc_attn_fn = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN, "weight", i), {hc_dim, hc_mix_dim}, flags);
+            layer.hc_attn_base = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE, "weight", i), {hc_mix_dim}, flags);
+            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, flags);
+            layer.hc_ffn_fn = create_tensor(tn(LLM_TENSOR_HC_FFN_FN, "weight", i), {hc_dim, hc_mix_dim}, flags);
+            layer.hc_ffn_base = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE, "weight", i), {hc_mix_dim}, flags);
+            layer.hc_ffn_scale = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE, "weight", i), {3}, flags);
+        }
         if (i < (int) hparams.n_layer_dense_lead) {
             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, flags);
             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, flags);
@@ -190,8 +331,15 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    const bool use_hc = hparams.dsv4_hc_mult > 0;
+    const int64_t hc = hparams.dsv4_hc_mult;
+
     // {n_embd, n_tokens}
     inpL = build_inp_embd(model.tok_embd);
+    if (use_hc) {
+        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -201,10 +349,19 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
-        ggml_tensor * inpSA = inpL;
+        ggml_tensor * residual = inpL;
+        ggml_tensor * post = nullptr;
+        ggml_tensor * comb = nullptr;
 
-        // norm
-        cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
+        if (use_hc) {
+            cur = deepseek32_hc_pre(ctx0, inpL,
+                    model.layers[il].hc_attn_fn, model.layers[il].hc_attn_scale, model.layers[il].hc_attn_base,
+                    norm_rms_eps, hparams.dsv4_hc_eps, hparams.dsv4_hc_sinkhorn_iters,
+                    n_embd, &post, &comb);
+        } else {
+            cur = inpL;
+        }
+        cur = build_norm(cur, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
         // self_attention
@@ -397,10 +554,30 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
         // when unmasked nextn embeddings are requested, t_h_nextn must keep all rows,
         // so the early output masking has to be skipped (it is applied after the final norm instead)
         if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
-            cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
-            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+            if (use_hc) {
+                ggml_tensor * residual_flat = ggml_reshape_2d(ctx0, residual, n_embd * hc, n_tokens);
+                residual_flat = ggml_get_rows(ctx0, residual_flat, inp_out_ids);
+                residual = ggml_reshape_3d(ctx0, residual_flat, n_embd, hc, n_outputs);
+                post = ggml_get_rows(ctx0, post, inp_out_ids);
+                ggml_tensor * comb_flat = ggml_reshape_2d(ctx0, comb, hc * hc, n_tokens);
+                comb_flat = ggml_get_rows(ctx0, comb_flat, inp_out_ids);
+                comb = ggml_reshape_3d(ctx0, comb_flat, hc, hc, n_outputs);
+            } else {
+                residual = ggml_get_rows(ctx0, residual, inp_out_ids);
+            }
         }
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+        if (use_hc) {
+            inpL = deepseek32_hc_post(ctx0, cur, residual, post, comb, n_embd);
+            residual = inpL;
+            cur = deepseek32_hc_pre(ctx0, inpL,
+                    model.layers[il].hc_ffn_fn, model.layers[il].hc_ffn_scale, model.layers[il].hc_ffn_base,
+                    norm_rms_eps, hparams.dsv4_hc_eps, hparams.dsv4_hc_sinkhorn_iters,
+                    n_embd, &post, &comb);
+        } else {
+            cur = ggml_add(ctx0, cur, residual);
+        }
+        ggml_tensor * ffn_inp = cur;
         cb(ffn_inp, "ffn_inp", il);
 
         cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
@@ -447,15 +624,23 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 cb(cur, "ffn_out", il);
             }
         }
-        cur = ggml_add(ctx0, cur, ffn_inp);
-
-        cur = build_cvec(cur, il);
-        cb(cur, "l_out", il);
+        if (use_hc) {
+            inpL = deepseek32_hc_post(ctx0, cur, residual, post, comb, n_embd);
+            inpL = build_cvec(inpL, il);
+        } else {
+            cur = ggml_add(ctx0, cur, ffn_inp);
+            inpL = build_cvec(cur, il);
+        }
+        cb(inpL, "l_out", il);
 
         // input for next layer
-        inpL = cur;
+        cur = inpL;
     }
     cur = inpL;
+
+    if (use_hc) {
+        cur = deepseek32_hc_mean(ctx0, cur);
+    }
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
@@ -563,7 +748,22 @@ llama_model_deepseek32::graph_mtp::graph_mtp(const llama_model & model, const ll
     ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
     cb(cur, "mtp_eh_proj", il);
 
-    ggml_tensor * inpSA = cur;
+    const bool use_hc = hparams.dsv4_hc_mult > 0;
+    const int64_t hc = hparams.dsv4_hc_mult;
+    ggml_tensor * inpL = cur;
+    if (use_hc) {
+        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+    }
+    ggml_tensor * residual = inpL;
+    ggml_tensor * post = nullptr;
+    ggml_tensor * comb = nullptr;
+    if (use_hc) {
+        cur = deepseek32_hc_pre(ctx0, inpL,
+                layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base,
+                norm_rms_eps, hparams.dsv4_hc_eps, hparams.dsv4_hc_sinkhorn_iters,
+                n_embd, &post, &comb);
+    }
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
@@ -653,7 +853,17 @@ llama_model_deepseek32::graph_mtp::graph_mtp(const llama_model & model, const ll
         cb(cur, "mtp_attn_out", il);
     }
 
-    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+    if (use_hc) {
+        inpL = deepseek32_hc_post(ctx0, cur, residual, post, comb, n_embd);
+        residual = inpL;
+        cur = deepseek32_hc_pre(ctx0, inpL,
+                layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base,
+                norm_rms_eps, hparams.dsv4_hc_eps, hparams.dsv4_hc_sinkhorn_iters,
+                n_embd, &post, &comb);
+    } else {
+        cur = ggml_add(ctx0, cur, residual);
+    }
+    ggml_tensor * ffn_inp = cur;
     cb(ffn_inp, "mtp_ffn_inp", il);
 
     cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
@@ -690,7 +900,12 @@ llama_model_deepseek32::graph_mtp::graph_mtp(const llama_model & model, const ll
     cur = ggml_add(ctx0, moe_out, ffn_shexp);
     cb(cur, "mtp_ffn_out", il);
 
-    cur = ggml_add(ctx0, cur, ffn_inp);
+    if (use_hc) {
+        inpL = deepseek32_hc_post(ctx0, cur, residual, post, comb, n_embd);
+        cur = deepseek32_hc_mean(ctx0, inpL);
+    } else {
+        cur = ggml_add(ctx0, cur, ffn_inp);
+    }
     cb(cur, "mtp_post_ffn", il);
 
     // shared_head_norm applied after the decoder block, before the shared LM head.

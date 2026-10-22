@@ -3137,6 +3137,14 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
         # For non-hf Mamba and Mamba2 models
         arch = hparams["ssm_cfg"].get("layer", "Mamba") + "ForCausalLM"
 
+    if model_type == ModelType.TEXT and arch == "DeepseekV3ForCausalLM" and all(
+        key in hparams for key in (
+            "num_residual_streams", "mhc_sinkhorn_iterations",
+            "index_n_heads", "index_head_dim", "index_topk",
+        )
+    ):
+        return "DeepseekV3MHCForCausalLM"
+
     # Step3-VL keeps text config under text_config but uses a custom top-level architecture.
     # For text conversion we route to a dedicated text-only class.
     # TODO: refactor this later to avoid adding exception here

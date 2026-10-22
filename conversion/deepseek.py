@@ -522,6 +522,90 @@ class DeepseekV32Model(DeepseekV2Model):
         self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
 
 
+@ModelBase.register("DeepseekV3MHCForCausalLM")
+class DeepseekV3MHCModel(DeepseekV32Model):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK32
+
+    _hc_tensor_map = {
+        ("attn_hc", "fn"): gguf.MODEL_TENSOR.HC_ATTN_FN,
+        ("attn_hc", "base"): gguf.MODEL_TENSOR.HC_ATTN_BASE,
+        ("attn_hc", "scale"): gguf.MODEL_TENSOR.HC_ATTN_SCALE,
+        ("ffn_hc", "fn"): gguf.MODEL_TENSOR.HC_FFN_FN,
+        ("ffn_hc", "base"): gguf.MODEL_TENSOR.HC_FFN_BASE,
+        ("ffn_hc", "scale"): gguf.MODEL_TENSOR.HC_FFN_SCALE,
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._hc_scales: dict[tuple[int, str], dict[str, Tensor]] = {}
+
+    def set_vocab(self):
+        DeepseekV2Model.set_vocab(self)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        if self.hparams["num_residual_streams"] != 4:
+            raise ValueError("DeepseekV3 mHC currently requires num_residual_streams=4")
+        if self.hparams.get("mhc_h_res_clamp_min", -30) != -30 or self.hparams.get("mhc_h_res_clamp_max", 30) != 30:
+            raise ValueError("DeepseekV3 mHC currently requires comb clamp [-30, 30]")
+        self.gguf_writer.add_hyper_connection_count(4)
+        self.gguf_writer.add_hyper_connection_sinkhorn_iterations(self.hparams["mhc_sinkhorn_iterations"])
+        self.gguf_writer.add_hyper_connection_epsilon(self.hparams.get("hc_eps", 1e-6))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        match = re.fullmatch(r"model\.layers\.(\d+)\.(attn_hc|ffn_hc)\.(mapping_weight|rms_weight|bias|alpha_pre|alpha_post|alpha_res)", name)
+        if match:
+            layer_idx = int(match.group(1))
+            hc_type = match.group(2)
+            param = match.group(3)
+            if bid is None:
+                bid = layer_idx
+
+            if param == "rms_weight":
+                return
+            if param == "mapping_weight":
+                rms_name = f"model.layers.{layer_idx}.{hc_type}.rms_weight"
+                if rms_name not in self.model_tensors:
+                    raise ValueError(f"missing mHC RMS weight {rms_name!r}")
+                rms_weight = self.model_tensors[rms_name]().float().reshape(1, -1)
+                hc = self.hparams["num_residual_streams"]
+                expected_input = hc * self.hparams["hidden_size"]
+                expected_output = (2 + hc) * hc
+                if data_torch.ndim != 2 or tuple(data_torch.shape) != (expected_output, expected_input) or rms_weight.shape[1] != expected_input:
+                    raise ValueError(f"unexpected mHC mapping/RMS shapes for {name}: {tuple(data_torch.shape)}, {tuple(rms_weight.shape)}")
+                tensor_enum = self._hc_tensor_map[(hc_type, "fn")]
+                yield (self.format_tensor_name(tensor_enum, bid), data_torch.float() * rms_weight)
+                return
+            if param == "bias":
+                hc = self.hparams["num_residual_streams"]
+                if data_torch.ndim != 1 or data_torch.shape[0] != (2 + hc) * hc:
+                    raise ValueError(f"unexpected mHC bias shape for {name}: {tuple(data_torch.shape)}")
+                tensor_enum = self._hc_tensor_map[(hc_type, "base")]
+                yield (self.format_tensor_name(tensor_enum, bid), data_torch)
+                return
+
+            scales = self._hc_scales.setdefault((bid, hc_type), {})
+            alpha_name = param.removeprefix("alpha_")
+            if alpha_name in scales:
+                raise ValueError(f"duplicate mHC scale {name!r}")
+            if data_torch.numel() != 1:
+                raise ValueError(f"expected scalar mHC scale in {name!r}, got shape {tuple(data_torch.shape)}")
+            scales[alpha_name] = data_torch.reshape(())
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+        for (bid, hc_type), scales in sorted(self._hc_scales.items()):
+            if set(scales) != {"pre", "post", "res"}:
+                raise ValueError(f"incomplete mHC scales for layer {bid} {hc_type}: {sorted(scales)}")
+            values = torch.stack((scales["pre"], scales["post"], scales["res"])).float().cpu().numpy()
+            tensor_enum = self._hc_tensor_map[(hc_type, "scale")]
+            self.gguf_writer.add_tensor(self.format_tensor_name(tensor_enum, bid), values)
+
+
 @ModelBase.register("DeepseekV4ForCausalLM")
 @ModelBase.example("deepseek-ai/DeepSeek-V4-Flash-Base")
 class DeepseekV4Model(TextModel):
