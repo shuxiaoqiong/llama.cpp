@@ -60,6 +60,9 @@ class Xing4_0Model(DeepseekV2Model):
 
         if is_mtp and re.search(r"\.(attn_hc|ffn_hc)\.", name):
             return None
+        # the NextN/MTP block runs dense MLA, no DSA indexer
+        if is_mtp and re.search(r"\.indexer\.", name):
+            return None
 
         # --no-mtp: drop the appended NextN block entirely.
         if is_mtp and cls.no_mtp:
@@ -93,9 +96,15 @@ class Xing4_0Model(DeepseekV2Model):
         self.gguf_writer.add_hyper_connection_count(
             hparams.get("hc_mult",  1))
         self.gguf_writer.add_hyper_connection_sinkhorn_iterations(
-            hparams.get("hc_sinkhorn_iters",  20))
+            hparams.get("mhc_sinkhorn_iterations", hparams.get("hc_sinkhorn_iters", 20)))
         self.gguf_writer.add_hyper_connection_epsilon(
             hparams.get("hc_eps",  1e-6))
+
+        # DSA indexer parameters (optional: absent in older checkpoints)
+        if (index_n_heads := hparams.get("index_n_heads")) is not None:
+            self.gguf_writer.add_indexer_head_count(index_n_heads)
+            self.gguf_writer.add_indexer_key_length(hparams["index_head_dim"])
+            self.gguf_writer.add_indexer_top_k(hparams["index_topk"])
 
     def set_vocab(self):
         # Xing4_0 uses a SentencePiece tokenizer (tokenizer.model + Xing4_0Tokenizer).

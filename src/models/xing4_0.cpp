@@ -9,6 +9,8 @@
 
 #include "models.h"
 
+#include "llama-kv-cache-dsa.h"
+
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -77,6 +79,16 @@ void llama_model_xing4_0::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     GGML_ASSERT(hparams.dsv4_hc_mult == 4 && "xing4_0 requires 4 residual streams");
+
+    // DSA indexer parameters (optional: absent in older checkpoints)
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head,    false);
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k,     false);
+    if (hparams.indexer_n_head > 0) {
+        GGML_ASSERT(hparams.indexer_head_size > 0 && hparams.indexer_top_k > 0);
+        // the indexer head layout is [rope | nope]
+        GGML_ASSERT(hparams.n_rot() <= hparams.indexer_head_size);
+    }
 
     if (ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL, hparams.rope_yarn_log_mul, false)) {
         // [TAG_DEEPSEEK2_YARN_LOG_MUL_FIX]
@@ -149,6 +161,15 @@ void llama_model_xing4_0::load_arch_tensors(llama_model_loader & ml) {
         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora_rank, n_embd_head_v_mla, n_head}, flags);
 
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v_mla, n_embd}, flags);
+
+        // DSA indexer (trunk layers only; the NextN/MTP block runs dense MLA)
+        if (i < n_layer && hparams.indexer_n_head > 0) {
+            layer.indexer_k_norm   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "weight", i), {hparams.indexer_head_size}, flags);
+            layer.indexer_k_norm_b = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "bias",   i), {hparams.indexer_head_size}, flags);
+            layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, flags);
+            layer.indexer_attn_k   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,   "weight", i), {n_embd, hparams.indexer_head_size}, flags);
+            layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * hparams.indexer_head_size}, flags);
+        }
 
         // MHC tensors (trunk layers only)
         if (i < n_layer) {
@@ -250,7 +271,7 @@ llama_model_xing4_0::graph_mtp::graph_mtp(const llama_model & model, const llm_g
     GGML_ASSERT(layer.ffn_down_shexp);
     GGML_ASSERT(layer.ffn_up_shexp);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
@@ -643,6 +664,12 @@ llama_model_xing4_0::graph::graph(const llama_model & model, const llm_graph_par
 
     const uint32_t kv_lora_rank = hparams.n_lora_kv;
 
+    // DSA indexer (optional: absent in older checkpoints)
+    const bool has_indexer = hparams.indexer_n_head > 0;
+    const int64_t n_indexer_head      = hparams.indexer_n_head;
+    const int64_t n_embd_indexer_head = hparams.indexer_head_size;
+    const uint32_t n_indexer_top_k    = hparams.indexer_top_k;
+
     // We have to pre-scale kq_scale and attn_factor to make the YaRN RoPE work correctly.
     // See https://github.com/ggml-org/llama.cpp/discussions/7416 for detailed explanation.
     // And also: https://github.com/ggml-org/llama.cpp/pull/17945 [TAG_DEEPSEEK2_YARN_LOG_MUL_FIX]
@@ -661,7 +688,8 @@ llama_model_xing4_0::graph::graph(const llama_model & model, const llm_graph_par
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
 
-    auto * inp_attn_k = build_attn_inp_k();
+    llm_graph_input_attn_k_dsa * inp_attn_dsa = has_indexer ? build_attn_inp_k_dsa() : nullptr;
+    llm_graph_input_attn_k    * inp_attn_k    = has_indexer ? nullptr : build_attn_inp_k();
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -692,6 +720,107 @@ llama_model_xing4_0::graph::graph(const llama_model & model, const llm_graph_par
 
         q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
         cb(q, "q_anorm", il);
+
+        ggml_tensor * top_k = nullptr;
+
+        // lightning indexer (DSA)
+        if (has_indexer) {
+            ggml_tensor * indexer_q = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, q);
+            cb(indexer_q, "indexer_q", il);
+
+            // {n_embd_indexer_head, n_indexer_head, n_tokens}
+            indexer_q = ggml_reshape_3d(ctx0, indexer_q, n_embd_indexer_head, n_indexer_head, n_tokens);
+            indexer_q = ggml_rope_ext(ctx0, indexer_q, inp_pos, nullptr, n_rot,
+                                 LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
+                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            cb(indexer_q, "indexer_q", il);
+
+            ggml_tensor * indexer_k = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
+            cb(indexer_k, "indexer_k", il);
+
+            indexer_k = build_norm(indexer_k, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, il);
+            cb(indexer_k, "indexer_k", il);
+
+            // {n_embd_indexer_head, 1, n_tokens}
+            indexer_k = ggml_reshape_3d(ctx0, indexer_k, n_embd_indexer_head, 1, n_tokens);
+            indexer_k = ggml_rope_ext(ctx0, indexer_k, inp_pos, nullptr, n_rot,
+                                 LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
+                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            cb(indexer_k, "indexer_k", il);
+
+            // perform Hadamard transform on indexer q and k
+            indexer_q = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_q);
+            cb(indexer_q, "indexer_q", il);
+            indexer_k = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_k);
+            cb(indexer_k, "indexer_k", il);
+
+            // store indexer keys to KV cache
+            const auto * mctx_lid = inp_attn_dsa->mctx->get_lid();
+            const auto & k_idxs_lid = inp_attn_dsa->get_k_idxs_lid();
+            ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, indexer_k, k_idxs_lid, il));
+
+            // prepare indexer weights
+            ggml_tensor * indexer_weights = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
+            cb(indexer_weights, "indexer_weights", il);
+
+            // get cached indexer keys
+            indexer_k = mctx_lid->get_k(ctx0, il);
+
+            // split the batch into streams if needed
+            const auto n_stream = indexer_k->ne[3];
+            indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream, indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
+            indexer_weights = ggml_view_4d(ctx0, indexer_weights, indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream, indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
+
+            // pre-scale weights to avoid scaling operations on huge indexer_score tensor
+            indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
+            cb(indexer_weights, "indexer_weights", il);
+
+            ggml_tensor * indexer_score = nullptr;
+            if (cparams.fused_lid) {
+                indexer_score = ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, inp_attn_dsa->get_kq_mask_lid());
+                cb(indexer_score, "indexer_score", il);
+                res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, indexer_score, il});
+            } else {
+                // calculate indexer kq
+                indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
+                cb(indexer_q, "indexer_q", il);
+                indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
+                cb(indexer_k, "indexer_k", il);
+
+                ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
+                cb(indexer_kq, "indexer_kq", il);
+
+                // ReLU requires contiguous tensors
+                indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
+                cb(indexer_kq, "indexer_kq", il);
+
+                // apply ReLU
+                indexer_score = ggml_relu(ctx0, indexer_kq);
+                cb(indexer_score, "indexer_score", il);
+
+                // multiply scores by indexer weights
+                indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
+                cb(indexer_score, "indexer_score", il);
+
+                // sum by q n_indexer_head dimension
+                indexer_score = ggml_sum_rows(ctx0, indexer_score);
+                cb(indexer_score, "indexer_score", il);
+
+                // permute result to match KQ mask
+                indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
+                cb(indexer_score, "indexer_score", il);
+
+                // mask indexer scores
+                ggml_tensor * indexer_kq_mask = inp_attn_dsa->get_kq_mask_lid();
+                indexer_score = ggml_add(ctx0, indexer_score, indexer_kq_mask);
+                cb(indexer_score, "indexer_score", il);
+            }
+
+            // get indices of top k indexer scores
+            uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
+            top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+            cb(top_k, "top_k", il);
+        }
 
         q = ggml_mul_mat(ctx0, layer.wq_b, q);
         cb(q, "q_b", il);
@@ -764,9 +893,15 @@ llama_model_xing4_0::graph::graph(const llama_model & model, const llm_graph_par
         cb(Vcur, "Vcur", il);
 
         // note: MLA with the absorption optimization converts into MQA (ie: GQA with 1 group)
-        cur = build_attn(inp_attn_k,
-                layer.wo, nullptr, layer.wo_s,
-                Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, kq_scale, il);
+        if (has_indexer) {
+            cur = build_attn(inp_attn_dsa,
+                    layer.wo, nullptr, layer.wo_s,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, top_k, kq_scale, il);
+        } else {
+            cur = build_attn(inp_attn_k,
+                    layer.wo, nullptr, layer.wo_s,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, kq_scale, il);
+        }
         cb(cur, "attn_out", il);
 
         if (il == n_layer - 1 && inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {

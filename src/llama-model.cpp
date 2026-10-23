@@ -2827,6 +2827,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             } break;
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_XING4_0:
             {
                 if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
                     // The NextN/MTP draft head runs dense MLA (no DSA indexer), so the
@@ -2850,6 +2851,25 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             hparams.swa_type,
                             nullptr,
                             filter,
+                            nullptr,
+                            nullptr);
+                } else if (arch == LLM_ARCH_XING4_0 && hparams.indexer_n_head == 0) {
+                    // legacy xing4_0 checkpoint without a DSA indexer: plain KV cache
+                    res = new llama_kv_cache(
+                            *this,
+                            hparams,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            1,
+                            hparams.n_swa,
+                            hparams.swa_type,
+                            nullptr,
+                            nullptr,
                             nullptr,
                             nullptr);
                 } else {
