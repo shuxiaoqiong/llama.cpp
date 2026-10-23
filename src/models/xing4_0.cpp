@@ -176,9 +176,11 @@ void llama_model_xing4_0::load_arch_tensors(llama_model_loader & ml) {
             layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {xing4_0_hc_dim, xing4_0_hc_mix_dim}, flags);
             layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {xing4_0_hc_mix_dim}, flags);
             layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, flags);
+            layer.hc_attn_norm  = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,  "weight", i), {n_embd, hparams.dsv4_hc_mult}, flags | TENSOR_ALLOW_RESHAPE);
             layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {xing4_0_hc_dim, xing4_0_hc_mix_dim}, flags);
             layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {xing4_0_hc_mix_dim}, flags);
             layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, flags);
+            layer.hc_ffn_norm   = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,   "weight", i), {n_embd, hparams.dsv4_hc_mult}, flags | TENSOR_ALLOW_RESHAPE);
         }
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, flags);
@@ -554,6 +556,7 @@ ggml_tensor * llama_model_xing4_0::graph::build_hc_pre(
         ggml_tensor * hc_fn,
         ggml_tensor * hc_scale,
         ggml_tensor * hc_base,
+        ggml_tensor * hc_norm,
         ggml_tensor ** post,
         ggml_tensor ** comb,
         int il) const {
@@ -565,8 +568,13 @@ ggml_tensor * llama_model_xing4_0::graph::build_hc_pre(
     GGML_ASSERT(hc == 4);
     GGML_ASSERT(hc_fn->ne[1] == hc_mix_dim);
 
-    ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
+    ggml_tensor * flat = ggml_reshape_3d(ctx0, x, n_embd, hc, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
+    if (hc_norm) {
+        ggml_tensor * gamma = ggml_reshape_3d(ctx0, hc_norm, n_embd, hc, 1);
+        flat_norm = ggml_mul(ctx0, flat_norm, gamma);
+    }
+    flat_norm = ggml_reshape_2d(ctx0, flat_norm, hc_dim, nt);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
     cb(mixes, "hc_mixes", il);
 
@@ -708,6 +716,7 @@ llama_model_xing4_0::graph::graph(const llama_model & model, const llm_graph_par
                 layer.hc_attn_fn,
                 layer.hc_attn_scale,
                 layer.hc_attn_base,
+                layer.hc_attn_norm,
                 &post, &comb, il);
         cb(cur, "hc_attn_pre", il);
 
@@ -923,6 +932,7 @@ llama_model_xing4_0::graph::graph(const llama_model & model, const llm_graph_par
                 layer.hc_ffn_fn,
                 layer.hc_ffn_scale,
                 layer.hc_ffn_base,
+                layer.hc_ffn_norm,
                 &post, &comb, il);
         cb(cur, "hc_ffn_pre", il);
 

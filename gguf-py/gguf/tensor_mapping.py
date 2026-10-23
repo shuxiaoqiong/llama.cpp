@@ -1540,6 +1540,11 @@ class TensorNameMap:
             "model.layers.{bid}.hc_attn_scale",                 # glm5-next
         ),
 
+        MODEL_TENSOR.HC_ATTN_NORM: (
+            "model.layers.{bid}.attn_hc.rms_weight",
+            "model.layers.{bid}.hc_attn_norm",
+        ),
+
         MODEL_TENSOR.HC_FFN_FN: (
             "model.layers.{bid}.hc_mlp_layer.hc_pre.hc_fn", # hy-v4
             "model.layers.{bid}.hc_ffn_fn",                 # glm5-next
@@ -1553,6 +1558,11 @@ class TensorNameMap:
         MODEL_TENSOR.HC_FFN_SCALE: (
             "model.layers.{bid}.hc_mlp_layer.hc_pre.hc_scale", # hy-v4
             "model.layers.{bid}.hc_ffn_scale",                 # glm5-next
+        ),
+
+        MODEL_TENSOR.HC_FFN_NORM: (
+            "model.layers.{bid}.ffn_hc.rms_weight",
+            "model.layers.{bid}.hc_ffn_norm",
         ),
 
         MODEL_TENSOR.HC_HEAD_FN: (

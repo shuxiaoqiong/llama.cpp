@@ -27,12 +27,14 @@ class Xing4_0Model(DeepseekV2Model):
 
 # map (prefix, kind) -> MODEL_TENSOR enum
     _hc_tensor_map = {
-        ("hc_attn", "fn"):    gguf.MODEL_TENSOR.HC_ATTN_FN,
-        ("hc_attn", "base"):  gguf.MODEL_TENSOR.HC_ATTN_BASE,
-        ("hc_attn", "scale"): gguf.MODEL_TENSOR.HC_ATTN_SCALE,
-        ("hc_ffn",  "fn"):    gguf.MODEL_TENSOR.HC_FFN_FN,
-        ("hc_ffn",  "base"):  gguf.MODEL_TENSOR.HC_FFN_BASE,
-        ("hc_ffn",  "scale"): gguf.MODEL_TENSOR.HC_FFN_SCALE,
+        ("hc_attn", "fn"):         gguf.MODEL_TENSOR.HC_ATTN_FN,
+        ("hc_attn", "base"):       gguf.MODEL_TENSOR.HC_ATTN_BASE,
+        ("hc_attn", "scale"):      gguf.MODEL_TENSOR.HC_ATTN_SCALE,
+        ("hc_attn", "rms_weight"): gguf.MODEL_TENSOR.HC_ATTN_NORM,
+        ("hc_ffn",  "fn"):         gguf.MODEL_TENSOR.HC_FFN_FN,
+        ("hc_ffn",  "base"):       gguf.MODEL_TENSOR.HC_FFN_BASE,
+        ("hc_ffn",  "scale"):      gguf.MODEL_TENSOR.HC_FFN_SCALE,
+        ("hc_ffn",  "rms_weight"): gguf.MODEL_TENSOR.HC_FFN_NORM,
     }
 
     def __init__(self, *args, **kwargs):
@@ -139,7 +141,7 @@ class Xing4_0Model(DeepseekV2Model):
 
             prefix = "hc_attn" if hc_type == "attn_hc" else "hc_ffn"
 
-            kind = {"hc_fn": "fn", "hc_base": "base", "hc_scale": "scale"}.get(param)
+            kind = {"hc_fn": "fn", "hc_base": "base", "hc_scale": "scale", "rms_weight": "rms_weight"}.get(param)
             if kind is None:
                 raise ValueError(f"unexpected mHC tensor: {name}")
             tensor_enum = self._hc_tensor_map[(prefix, kind)]
