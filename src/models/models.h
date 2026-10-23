@@ -1458,7 +1458,6 @@ struct llama_model_xing4_0 : public llama_model_base {
                 ggml_tensor * hc_fn,
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base,
-                ggml_tensor * hc_norm,
                 ggml_tensor ** post,
                 ggml_tensor ** comb,
                 int il) const;
