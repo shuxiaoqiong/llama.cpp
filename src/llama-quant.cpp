@@ -316,13 +316,6 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize the i32 token-id -> expert-id routing table (DeepSeek-V4)
     quantize &= name.find("ffn_gate_tid2eid.weight") == std::string::npos;
 
-    // do not quantize MHC hyper-connection gate matrices (xing4_0/deepseek4):
-    // precision-sensitive, must stay F32 to match the vllm reference
-    // (the 1D hc_*_base / hc_*_scale tensors are already excluded by the n_dims < 2 rule)
-    quantize &= name.find("hc_attn_fn.weight") == std::string::npos;
-    quantize &= name.find("hc_ffn_fn.weight")  == std::string::npos;
-    quantize &= name.find("hc_head_fn.weight") == std::string::npos;
-
     // these are very small (e.g. 4x4)
     quantize &= name.find("altup")  == std::string::npos;
     quantize &= name.find("laurel") == std::string::npos;
@@ -359,6 +352,12 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find("attn_kv_a_mqa.weight")    == std::string::npos;
         quantize &= name.find("attn_k_b.weight")         == std::string::npos;
         quantize &= name.find("attn_v_b.weight")         == std::string::npos;
+    }
+
+    // xing4_0: do not quantize the MHC hyper-connection gate matrices
+    // (the 1D hc_*_base / hc_*_scale tensors are already excluded by the n_dims < 2 rule)
+    if (arch == LLM_ARCH_XING4_0) {
+        quantize &= name.find("hc_") == std::string::npos;
     }
 
     // the decision head of vllm-decision2 is small and computed in F32

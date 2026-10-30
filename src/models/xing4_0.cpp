@@ -6,6 +6,21 @@
 // deepseek4.cpp, with two model-specific differences:
 //   * the comb logits are clamped to [-30, 30] before the Sinkhorn iterations
 //   * the residual streams are averaged (xing4_0_hc_mean) at the head, no hc_head
+//
+// The fused MHC ops reuse the dsv4 hyper-connection ops (GGML_OP_DSV4_HC_*):
+//   * hc_pre is bit-identical (non-gated, scale 1.0);
+//   * hc_comb feeds the xing4_0 mixes buffer to ggml_dsv4_hc_comb unchanged --
+//     the flat [src + 4*dst] layout makes dsv4's dst-indexed softmax run over
+//     xing4_0's src axis, so the Sinkhorn phases align; the output [src, dst]
+//     layout matches the decomposed path. Differences vs the reference
+//     with_clamp kernel: no [-30, 30] logits clamp, softmax-normalized values
+//     get +eps, and the first denominator has no eps -- ~1e-5 logits error on
+//     typical inputs (the decomposed fallback keeps the exact clamp semantics);
+//   * hc_post transposes comb to dsv4's [dst, src] indexing with a
+//     ggml_cont(ggml_permute(...)) before the fused call.
+//
+// The decomposed fallbacks (used when the fused ops are unavailable or
+// disabled) keep the exact reference semantics, including the logits clamp.
 
 #include "models.h"
 
@@ -464,9 +479,9 @@ ggml_tensor * llama_model_xing4_0::graph::build_hc_pre(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[2];
 
-    if (cparams.fused_xing4_0_hc_pre && il >= 0) {
-        ggml_tensor * result = ggml_xing4_0_hc_pre(ctx0, x, weights);
-        res->add_fused_node({LLM_FUSED_OP_XING4_0_HC_PRE, result, il});
+    if (cparams.fused_dsv4_hc_pre && il >= 0) {
+        ggml_tensor * result = ggml_dsv4_hc_pre(ctx0, x, weights);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, result, il});
         return result;
     }
 
@@ -492,12 +507,12 @@ ggml_tensor * llama_model_xing4_0::graph::build_hc_sinkhorn(
     // added to the normalization denominators, never to the values.
     // ggml_soft_max also performs the reference's first column normalization.
     //
-    // NOTE: this decomposed fallback (only used when fused_xing4_0_hc_comb is off)
+    // NOTE: this decomposed fallback (only used when fused_dsv4_hc_comb is off)
     // cannot add eps to the first src-normalization because ggml_soft_max
-    // divides by the raw sum. The fused ggml_xing4_0_hc_comb path replicates
-    // with_clamp bit-exactly (exp(-max), then all eps-normalizations in the
-    // loop); this path differs from it by ~1e-6 (eps missing in the very first
-    // src normalization).
+    // divides by the raw sum. It keeps the exact reference semantics otherwise,
+    // including the [-30, 30] logits clamp applied by the caller; the fused
+    // ggml_dsv4_hc_comb path differs from the reference as described in the
+    // file header (no clamp, +eps on values, first denominator without eps).
     comb = ggml_soft_max(ctx0, comb);
 
     ggml_tensor * eps = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
@@ -567,10 +582,14 @@ ggml_tensor * llama_model_xing4_0::graph::build_hc_pre(
     *post = ggml_scale(ctx0, *post, 2.0f);
     cb(*post, "hc_post", il);
 
-    if (cparams.fused_xing4_0_hc_comb) {
-        *comb = ggml_xing4_0_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
+    if (cparams.fused_dsv4_hc_comb) {
+        // feed the xing4_0 mixes buffer unchanged: the flat [src + 4*dst] layout
+        // makes dsv4's dst-indexed softmax run over xing4_0's src axis, so the
+        // Sinkhorn phases align and the output is [src, dst] as the decomposed
+        // path expects (see the file header for the precision notes)
+        *comb = ggml_dsv4_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
                 (int32_t) hparams.dsv4_hc_sinkhorn_iters);
-        res->add_fused_node({LLM_FUSED_OP_XING4_0_HC_COMB, *comb, il});
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, *comb, il});
     } else {
         ggml_tensor * scale_comb = xing4_0_view_1d(ctx0, hc_scale, 1, 2);
         ggml_tensor * base_comb  = xing4_0_view_1d(ctx0, hc_base, hc*hc, 2*hc);
@@ -599,9 +618,11 @@ ggml_tensor * llama_model_xing4_0::graph::build_hc_post(
     GGML_ASSERT(x->ne[0] == n_embd);
     GGML_ASSERT(residual->ne[1] == hparams.dsv4_hc_mult);
 
-    if (cparams.fused_xing4_0_hc_post) {
-        ggml_tensor * result = ggml_xing4_0_hc_post(ctx0, x, residual, post, comb);
-        res->add_fused_node({LLM_FUSED_OP_XING4_0_HC_POST, result, il});
+    if (cparams.fused_dsv4_hc_post) {
+        // dsv4 reads comb[dst, src]; xing4_0's comb is [src, dst] -- transpose
+        ggml_tensor * comb_t = ggml_cont(ctx0, ggml_permute(ctx0, comb, 1, 0, 2, 3));
+        ggml_tensor * result = ggml_dsv4_hc_post(ctx0, x, residual, post, comb_t);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, result, il});
         return result;
     }
 
